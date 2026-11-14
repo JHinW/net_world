@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log"
@@ -142,6 +143,7 @@ func printUsage() {
   mesh-bridge [flags] parse <tc-addr>
 
 Flags:
+  --env-file=<path>                  Load environment variables from a custom .env file
   --key=<path|name>                  Server key path or name (also used as client key fallback)
   --client-key=<path|name>           Client identity key path or name
   --addr-file=<path|tcp:host:port>   Write active server tailcat address to file or TCP endpoint
@@ -158,6 +160,7 @@ Flags:
 
 func main() {
 	var (
+		envFileFlag       string
 		keyFlag           string
 		clientKeyFlag     string
 		sshIdentityFlag   string
@@ -190,6 +193,11 @@ func main() {
 		}
 
 		switch {
+		case strings.HasPrefix(arg, "--env-file="):
+			envFileFlag = strings.TrimPrefix(arg, "--env-file=")
+		case arg == "--env-file" && i+1 < len(os.Args):
+			i++
+			envFileFlag = os.Args[i]
 		case strings.HasPrefix(arg, "--key="):
 			keyFlag = strings.TrimPrefix(arg, "--key=")
 		case arg == "--key" && i+1 < len(os.Args):
@@ -262,6 +270,20 @@ func main() {
 		}
 	}
 
+	if envPath := cmp.Or(envFileFlag, os.Getenv("TAILCAT_ENV_FILE")); envPath != "" {
+		if err := loadEnvFile(envPath); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+
+	keyFlag = cmp.Or(keyFlag, os.Getenv("TAILCAT_KEY"))
+	clientKeyFlag = cmp.Or(clientKeyFlag, os.Getenv("TAILCAT_CLIENT_KEY"))
+	if !verbose {
+		envVerbose := strings.TrimSpace(os.Getenv("TAILCAT_VERBOSE"))
+		verbose = envVerbose == "1" || strings.EqualFold(envVerbose, "true")
+	}
+
 	vault := NewIdentityVault(derpMapURL)
 	app := &BridgeApp{
 		Vault:                 vault,
@@ -276,8 +298,10 @@ func main() {
 		Verbose:               verbose,
 	}
 
+	defaultBridgePort := parsePortArg(os.Getenv("TAILCAT_BRIDGE_PORT"), 19100)
+
 	if len(positional) == 0 {
-		if err := app.RunBridge(context.Background(), 19100); err != nil {
+		if err := app.RunBridge(context.Background(), defaultBridgePort); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -289,9 +313,9 @@ func main() {
 
 	switch subcmd {
 	case "bridge":
-		port := uint16(19100)
+		port := defaultBridgePort
 		if len(rest) > 0 {
-			port = parsePortArg(rest[0], 19100)
+			port = parsePortArg(rest[0], defaultBridgePort)
 		}
 		if err := app.RunBridge(context.Background(), port); err != nil {
 			fmt.Fprintln(os.Stderr, err)

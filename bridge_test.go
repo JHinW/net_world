@@ -306,4 +306,62 @@ func TestMultiRegionCandidateSplitAndOrderedFailover(t *testing.T) {
 	}
 }
 
+func TestLoadEnvFile(t *testing.T) {
+	tmp := t.TempDir()
+	envPath := filepath.Join(tmp, "custom.env")
+	content := strings.Join([]string{
+		"# comment line",
+		"",
+		"TAILCAT_BRIDGE_PORT=29100 # inline comment",
+		`export TAILCAT_SSH_MODE="local"`,
+		`TAILCAT_SERVE_PORTS='8080,9000-9005'`,
+		`TAILCAT_ALLOW_CLIENTS="nodekey:abc\"def"`,
+		"TAILCAT_EMPTY=",
+	}, "\n")
+	if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write env file: %v", err)
+	}
+
+	keys := []string{
+		"TAILCAT_BRIDGE_PORT",
+		"TAILCAT_SSH_MODE",
+		"TAILCAT_SERVE_PORTS",
+		"TAILCAT_ALLOW_CLIENTS",
+		"TAILCAT_EMPTY",
+	}
+	for _, k := range keys {
+		t.Setenv(k, "")
+	}
+
+	if err := loadEnvFile(envPath); err != nil {
+		t.Fatalf("loadEnvFile failed: %v", err)
+	}
+
+	want := map[string]string{
+		"TAILCAT_BRIDGE_PORT":   "29100",
+		"TAILCAT_SSH_MODE":      "local",
+		"TAILCAT_SERVE_PORTS":   "8080,9000-9005",
+		"TAILCAT_ALLOW_CLIENTS": `nodekey:abc"def`,
+		"TAILCAT_EMPTY":         "",
+	}
+	for k, w := range want {
+		if got := os.Getenv(k); got != w {
+			t.Errorf("env %s = %q, want %q", k, got, w)
+		}
+	}
+
+	badPath := filepath.Join(tmp, "bad.env")
+	if err := os.WriteFile(badPath, []byte("INVALID_LINE_WITHOUT_EQUALS\n"), 0o600); err != nil {
+		t.Fatalf("write bad env file: %v", err)
+	}
+	if err := loadEnvFile(badPath); err == nil {
+		t.Fatal("expected error for malformed env line, got nil")
+	}
+
+	if err := loadEnvFile(filepath.Join(tmp, "missing.env")); err == nil {
+		t.Fatal("expected error for missing env file, got nil")
+	}
+}
+
+
 

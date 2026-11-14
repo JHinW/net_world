@@ -16,3 +16,9 @@
 
 # macOS
 .DS_Store
+
+# Environment files (keep .env.example tracked)
+.env
+.env.*
+!.env.example
+
