@@ -168,10 +168,7 @@ func (g *InboundGateway) Start(ctx context.Context) (tailcat.Addr, error) {
 
 		var builtinSSHHandler func(net.Conn)
 		if sshMode == "builtin" {
-			builtinSSHHandler = srv.SSHConnHandler(tailcat.SSHOptions{
-				Shell:          true,
-				AuthorizedKeys: authKeys,
-			})
+			builtinSSHHandler = newBuiltinSSHHandler(authKeys, g.Logf)
 		}
 
 		srv.OnTCP = func(port uint16) func(net.Conn) {

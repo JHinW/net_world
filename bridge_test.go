@@ -3,8 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -12,7 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pkg/sftp"
 	"github.com/tailscale/tailcat"
+	gossh "golang.org/x/crypto/ssh"
 	"tailscale.com/tailcfg"
 )
 
@@ -362,6 +367,177 @@ func TestLoadEnvFile(t *testing.T) {
 		t.Fatal("expected error for missing env file, got nil")
 	}
 }
+
+func TestBuiltinSSHDirectTCPIPAndSFTP(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519 key: %v", err)
+	}
+	signer, err := gossh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	pubLine := string(gossh.MarshalAuthorizedKey(signer.PublicKey()))
+
+	handler := newBuiltinSSHHandler([]string{pubLine}, nil)
+	sshLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen ssh: %v", err)
+	}
+	defer sshLn.Close()
+	go func() {
+		for {
+			c, err := sshLn.Accept()
+			if err != nil {
+				return
+			}
+			go handler(c)
+		}
+	}()
+
+	sshClient, err := gossh.Dial("tcp", sshLn.Addr().String(), &gossh.ClientConfig{
+		User:            "testuser",
+		Auth:            []gossh.AuthMethod{gossh.PublicKeys(signer)},
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("ssh dial builtin server: %v", err)
+	}
+	defer sshClient.Close()
+
+	// 1. Non-interactive command execution (used by VS Code bootstrap script)
+	sess, err := sshClient.NewSession()
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	out, err := sess.CombinedOutput("echo vscode-ready")
+	_ = sess.Close()
+	if err != nil {
+		t.Fatalf("exec command failed: %v (output: %s)", err, string(out))
+	}
+	if strings.TrimSpace(string(out)) != "vscode-ready" {
+		t.Fatalf("unexpected exec output: %q", string(out))
+	}
+
+	// 2. Local TCP port forwarding ("direct-tcpip") required by VS Code Remote - SSH
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen echo target: %v", err)
+	}
+	defer echoLn.Close()
+	go func() {
+		c, err := echoLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _ = io.Copy(c, c)
+	}()
+
+	tunConn, err := sshClient.Dial("tcp", echoLn.Addr().String())
+	if err != nil {
+		t.Fatalf("direct-tcpip dial through builtin SSH failed: %v", err)
+	}
+	defer tunConn.Close()
+	msg := "hello-vscode-tunnel"
+	if _, err := io.WriteString(tunConn, msg); err != nil {
+		t.Fatalf("write tunnel: %v", err)
+	}
+	buf := make([]byte, len(msg))
+	if _, err := io.ReadFull(tunConn, buf); err != nil {
+		t.Fatalf("read tunnel: %v", err)
+	}
+	if string(buf) != msg {
+		t.Fatalf("tunnel echo mismatch: got %q, want %q", string(buf), msg)
+	}
+
+	// 3. SFTP subsystem required by VS Code Remote file operations
+	sftpClient, err := sftp.NewClient(sshClient)
+	if err != nil {
+		t.Fatalf("start sftp client over builtin SSH: %v", err)
+	}
+	defer sftpClient.Close()
+
+	tmpFile := filepath.Join(t.TempDir(), "sftp_check.txt")
+	f, err := sftpClient.Create(tmpFile)
+	if err != nil {
+		t.Fatalf("sftp create file: %v", err)
+	}
+	if _, err := f.Write([]byte("sftp-ok")); err != nil {
+		t.Fatalf("sftp write: %v", err)
+	}
+	_ = f.Close()
+
+	gotBytes, err := os.ReadFile(tmpFile)
+	if err != nil || string(gotBytes) != "sftp-ok" {
+		t.Fatalf("sftp file content mismatch: %v, %q", err, string(gotBytes))
+	}
+}
+
+func TestRenderAndUpsertSSHConfig(t *testing.T) {
+	tmp := t.TempDir()
+	vault := NewIdentityVault("https://derp.example.com/derpmap.json")
+	serverKeyPath := filepath.Join(tmp, "srv.private.json")
+	tcAddr, err := vault.GenerateServerKey(t.Context(), serverKeyPath, false, true)
+	if err != nil {
+		t.Fatalf("GenerateServerKey: %v", err)
+	}
+
+	sc := NewStandaloneClient(vault, "client-dev", nil)
+	sc.SSHIdentityFile = "/Users/dev/.ssh/id_ed25519"
+
+	block1, err := sc.RenderSSHConfigBlock("my-dev", "root@"+string(tcAddr), "22", "/usr/local/bin/net_world")
+	if err != nil {
+		t.Fatalf("RenderSSHConfigBlock: %v", err)
+	}
+	for _, wantSub := range []string{
+		"# BEGIN net_world:my-dev",
+		"Host my-dev",
+		"User root",
+		"ProxyCommand '/usr/local/bin/net_world' '--client-key=client-dev' '--derpmap-url=https://derp.example.com/derpmap.json' 'connect' '" + string(tcAddr) + "' '22'",
+		"IdentityFile /Users/dev/.ssh/id_ed25519",
+		"# END net_world:my-dev",
+	} {
+		if !strings.Contains(block1, wantSub) {
+			t.Fatalf("generated SSH config block missing %q:\n%s", wantSub, block1)
+		}
+	}
+
+	cfgPath := filepath.Join(tmp, "ssh_config")
+	if err := os.WriteFile(cfgPath, []byte("Host existing\n    HostName 10.0.0.1\n"), 0o600); err != nil {
+		t.Fatalf("write initial ssh_config: %v", err)
+	}
+
+	if _, err := UpsertSSHConfigFile(cfgPath, "my-dev", block1); err != nil {
+		t.Fatalf("UpsertSSHConfigFile insert: %v", err)
+	}
+
+	// Update with a new user and verify in-place replacement preserves existing host
+	block2, err := sc.RenderSSHConfigBlock("my-dev", "ubuntu@"+string(tcAddr), "2222", "/usr/local/bin/net_world")
+	if err != nil {
+		t.Fatalf("RenderSSHConfigBlock update: %v", err)
+	}
+	if _, err := UpsertSSHConfigFile(cfgPath, "my-dev", block2); err != nil {
+		t.Fatalf("UpsertSSHConfigFile update: %v", err)
+	}
+
+	finalRaw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read final ssh_config: %v", err)
+	}
+	finalStr := string(finalRaw)
+	if !strings.Contains(finalStr, "Host existing") {
+		t.Fatalf("existing Host entry lost:\n%s", finalStr)
+	}
+	if strings.Count(finalStr, "# BEGIN net_world:my-dev") != 1 {
+		t.Fatalf("expected exactly 1 managed block, got:\n%s", finalStr)
+	}
+	if !strings.Contains(finalStr, "User ubuntu") || strings.Contains(finalStr, "User root") {
+		t.Fatalf("expected updated block in ssh_config, got:\n%s", finalStr)
+	}
+}
+
 
 
 
