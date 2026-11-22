@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -491,11 +492,15 @@ func TestRenderAndUpsertSSHConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderSSHConfigBlock: %v", err)
 	}
+	wantProxyCmd := "ProxyCommand '/usr/local/bin/net_world' '--client-key=client-dev' '--derpmap-url=https://derp.example.com/derpmap.json' 'connect' '" + string(tcAddr) + "' '22'"
+	if runtime.GOOS == "windows" {
+		wantProxyCmd = `ProxyCommand "/usr/local/bin/net_world" "--client-key=client-dev" "--derpmap-url=https://derp.example.com/derpmap.json" "connect" "` + string(tcAddr) + `" "22"`
+	}
 	for _, wantSub := range []string{
 		"# BEGIN net_world:my-dev",
 		"Host my-dev",
 		"User root",
-		"ProxyCommand '/usr/local/bin/net_world' '--client-key=client-dev' '--derpmap-url=https://derp.example.com/derpmap.json' 'connect' '" + string(tcAddr) + "' '22'",
+		wantProxyCmd,
 		"IdentityFile /Users/dev/.ssh/id_ed25519",
 		"# END net_world:my-dev",
 	} {
