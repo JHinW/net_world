@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -106,8 +107,12 @@ func newBuiltinSSHHandler(authKeys []string, logf logger.Logf) func(net.Conn) {
 func handleSFTPSubsystem(logf logger.Logf) ssh.SubsystemHandler {
 	return func(sess ssh.Session) {
 		var opts []sftp.ServerOption
-		if home, err := os.UserHomeDir(); err == nil && home != "" {
-			opts = append(opts, sftp.WithServerWorkingDirectory(home))
+		// pkg/sftp uses path.IsAbs (POSIX) before toLocalPath, so setting workDir
+		// on Windows causes drive-letter paths like C:\... to be joined onto workDir.
+		if runtime.GOOS != "windows" {
+			if home, err := os.UserHomeDir(); err == nil && home != "" {
+				opts = append(opts, sftp.WithServerWorkingDirectory(home))
+			}
 		}
 		srv, err := sftp.NewServer(sess, opts...)
 		if err != nil {
