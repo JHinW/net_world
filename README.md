@@ -49,6 +49,8 @@ TAILCAT_ENV_FILE=.env.custom ./net_world
 | :--- | :--- | :--- |
 | `bridge`（默认） | `net_world [flags] [bridge [port]]` | 启动统一单进程网关：后台启动入站服务（默认 `19100` + SSH `22`），并在 `stdin/stdout` 运行出站多路复用器 |
 | `ssh` | `net_world [flags] ssh [-p <port>] [user@]<tc-addr> [command [args...]]` | 通过 Tailcat 连接目标节点 SSH（默认端口 `22`） |
+| `ssh-config` | `net_world [flags] ssh-config [--write] [<alias>] [user@]<tc-addr>` | 生成 VS Code Remote - SSH / OpenSSH 所需的 `Host` 配置块，支持 `--write` 幂等写入 `~/.ssh/config` |
+| `vscode` | `net_world [flags] vscode [<alias>] [user@]<tc-addr> [remote-path]` | 自动配置 `~/.ssh/config` 并直接拉起本地 VS Code 连接远端主机与目录 |
 | `connect` | `net_world [flags] connect <tc-addr> [port\|ip:port]` | 将 `stdin/stdout` 透传到目标节点指定端口（默认 `22`）；支持简写 `net_world <tc-addr> [port]` |
 | `forward` | `net_world [flags] forward [--bind=127.0.0.1] <tc-addr> <[local:]remote-port> [...]` | 将远端节点端口转发到本地 TCP 端口 |
 | `genkey` | `net_world [flags] genkey [--client] [--fixed-region] [--force]` | 生成服务端密钥（输出 `tc...` 地址）或客户端密钥（`--client`，输出 `nodekey:...`） |
@@ -69,8 +71,10 @@ TAILCAT_ENV_FILE=.env.custom ./net_world
 | `--allow=<nodekeys>` | 允许接入的客户端节点公钥白名单（逗号分隔的 `nodekey:...`） |
 | `--derpmap-url=<url>` | 自定义 DERP Map URL |
 | `--bind=<ip>` | `forward` 子命令的本地绑定 IP（默认：`127.0.0.1`） |
-| `-p, --port=<port\|ip:port>` | `ssh` 子命令的目标端口（默认：`22`） |
-| `-i, --identity=<ssh-private-key>` | `ssh` 子命令使用的私钥路径（默认自动探测 `.mesh/ssh_id_ed25519`） |
+| `-p, --port=<port\|ip:port>` | `ssh` / `ssh-config` / `vscode` 子命令的目标端口（默认：`22`） |
+| `-i, --identity=<ssh-private-key>` | `ssh` / `ssh-config` / `vscode` 子命令使用的私钥路径（默认自动探测 `.mesh/ssh_id_ed25519`） |
+| `-w, --write` | `ssh-config` 子命令：将生成的 `Host` 配置块幂等写入 `~/.ssh/config` |
+| `--ssh-config=<path>` | `ssh-config` / `vscode` 子命令：自定义 SSH 配置文件路径（默认：`~/.ssh/config`） |
 | `-v, --verbose` | 输出详细运行日志 |
 | `--client` / `--fixed-region` / `-f, --force` | `genkey` 子命令选项 |
 
@@ -98,14 +102,18 @@ TAILCAT_ENV_FILE=.env.custom ./net_world
 
 ```text
 .
-├── main.go         # CLI 入口、参数解析与 BridgeApp 编排
-├── inbound.go      # InboundGateway：入站网关、端口暴露与 SSH 服务
-├── outbound.go     # OutboundMultiplexer：基于 stdin/stdout 的出站多路复用器
-├── client.go       # StandaloneClient：ssh / connect / forward 客户端实现
-├── identity.go     # IdentityVault：服务端/客户端密钥、SSH 私钥与地址解析
-├── envfile.go      # 自定义 .env 文件解析器
-├── bridge_test.go  # 单元测试
-├── .env.example    # 环境变量配置模板
-├── go.mod / go.sum # Go 模块依赖定义
+├── main.go             # CLI 入口、参数解析与 BridgeApp 编排
+├── inbound.go          # InboundGateway：入站网关、端口暴露与 SSH 服务
+├── ssh_server.go       # 内置零依赖 SSH Server（支持 VS Code 端口转发、Unix Socket 转发与 SFTP）
+├── ssh_pty_unix.go     # Unix/macOS PTY 终端与会话环境实现
+├── ssh_pty_windows.go  # Windows 会话环境实现
+├── outbound.go         # OutboundMultiplexer：基于 stdin/stdout 的出站多路复用器
+├── client.go           # StandaloneClient：ssh / ssh-config / vscode / connect / forward 客户端实现
+├── identity.go         # IdentityVault：服务端/客户端密钥、SSH 私钥与地址解析
+├── envfile.go          # 自定义 .env 文件解析器
+├── bridge_test.go      # 单元测试
+├── doc/                # 专题文档（含 VS Code Remote - SSH 支持指南）
+├── .env.example        # 环境变量配置模板
+├── go.mod / go.sum     # Go 模块依赖定义
 └── .gitignore
 ```

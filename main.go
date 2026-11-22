@@ -137,6 +137,8 @@ func printUsage() {
 	fmt.Println(`Usage:
   mesh-bridge [flags] [bridge [port]]
   mesh-bridge [flags] ssh [-p <port>] [user@]<tc-addr> [command [args...]]
+  mesh-bridge [flags] ssh-config [--write] [--ssh-config=<path>] [<alias>] [user@]<tc-addr>
+  mesh-bridge [flags] vscode [--ssh-config=<path>] [<alias>] [user@]<tc-addr> [remote-path]
   mesh-bridge [flags] connect <tc-addr> [port|ip:port]
   mesh-bridge [flags] forward [--bind=127.0.0.1] <tc-addr> <[local:]remote-port> [...]
   mesh-bridge [flags] genkey [--client] [--fixed-region] [--force]
@@ -153,8 +155,10 @@ Flags:
   --allow=<nodekeys>                 Comma-separated allowed client node public keys (nodekey:...)
   --derpmap-url=<url>                Custom DERP map URL
   --bind=<ip>                        Local bind address for 'forward' (default: 127.0.0.1)
-  -p, --port=<port|ip:port>          Remote SSH port for 'ssh' (default: 22)
-  -i, --identity=<ssh-private-key>   SSH private key file for 'ssh' (default: auto-detect .mesh/ssh_id_ed25519)
+  -p, --port=<port|ip:port>          Remote SSH port for 'ssh'/'ssh-config'/'vscode' (default: 22)
+  -i, --identity=<ssh-private-key>   SSH private key file for 'ssh'/'ssh-config'/'vscode'
+  -w, --write                        Write generated Host block into ~/.ssh/config (for 'ssh-config')
+  --ssh-config=<path>                Custom SSH config file path (default: ~/.ssh/config)
   -v, --verbose                      Enable verbose logging`)
 }
 
@@ -172,6 +176,8 @@ func main() {
 		allowClientsFlag  string
 		bindAddrFlag      string
 		sshPortFlag       string
+		sshConfigPathFlag string
+		writeConfigFlag   bool
 		verbose           bool
 		fixedRegion       bool
 		clientModeKey     bool
@@ -249,6 +255,13 @@ func main() {
 		case (arg == "-i" || arg == "--identity") && i+1 < len(os.Args):
 			i++
 			sshIdentityFlag = os.Args[i]
+		case strings.HasPrefix(arg, "--ssh-config="):
+			sshConfigPathFlag = strings.TrimPrefix(arg, "--ssh-config=")
+		case arg == "--ssh-config" && i+1 < len(os.Args):
+			i++
+			sshConfigPathFlag = os.Args[i]
+		case arg == "--write" || arg == "-w":
+			writeConfigFlag = true
 		case arg == "--verbose" || arg == "-v":
 			verbose = true
 		case arg == "--fixed-region":
@@ -324,6 +337,18 @@ func main() {
 
 	case "ssh":
 		if err := app.standaloneClient().ExecSSH(sshPortFlag, rest); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+
+	case "ssh-config":
+		if err := app.standaloneClient().ExecSSHConfig(sshPortFlag, sshConfigPathFlag, writeConfigFlag, rest); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+
+	case "vscode":
+		if err := app.standaloneClient().ExecVSCode(sshPortFlag, sshConfigPathFlag, rest); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -430,3 +431,230 @@ func (c *StandaloneClient) ForwardPorts(ctx context.Context, bindAddr string, ra
 	<-ctx.Done()
 	return nil
 }
+
+// RenderSSHConfigBlock generates a managed ~/.ssh/config Host block for VS Code Remote - SSH
+// and OpenSSH clients. The full tailcat address is embedded into ProxyCommand so multi-region
+// failover addresses work seamlessly without hitting hostname length limits.
+func (c *StandaloneClient) RenderSSHConfigBlock(alias, dstSpec, portOrIPPort, selfExe string) (string, error) {
+	alias = strings.TrimSpace(alias)
+	if alias == "" || strings.ContainsAny(alias, " \t\r\n") {
+		return "", fmt.Errorf("invalid SSH host alias %q", alias)
+	}
+	canonicalPort, err := validateSSHPortSpec(cmp.Or(strings.TrimSpace(portOrIPPort), "22"))
+	if err != nil {
+		return "", err
+	}
+
+	dst := strings.TrimSpace(dstSpec)
+	sshUser, addrStr, hasUser := strings.Cut(dst, "@")
+	if !hasUser {
+		addrStr = sshUser
+		sshUser = ""
+	}
+	addrStr = strings.TrimSpace(addrStr)
+	if _, err := c.Vault.ParseCandidateAddrs(addrStr); err != nil {
+		return "", fmt.Errorf("invalid tailcat address %q: %w", addrStr, err)
+	}
+
+	if strings.TrimSpace(selfExe) == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			return "", fmt.Errorf("resolve executable path: %w", err)
+		}
+		selfExe = exe
+	}
+
+	proxyCmd, err := c.buildSSHProxyCommand(selfExe, addrStr, canonicalPort)
+	if err != nil {
+		return "", err
+	}
+
+	var identityFile string
+	if c.Vault != nil {
+		identityFile = c.Vault.ResolveSSHIdentityFile(c.SSHIdentityFile, selfExe)
+	} else {
+		identityFile = strings.TrimSpace(c.SSHIdentityFile)
+	}
+
+	knownHostsNull := "/dev/null"
+	if runtime.GOOS == "windows" {
+		knownHostsNull = "NUL"
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "# BEGIN net_world:%s\n", alias)
+	fmt.Fprintf(&b, "Host %s\n", alias)
+	fmt.Fprintf(&b, "    HostName %s\n", shortSSHDestHost(addrStr))
+	if sshUser != "" {
+		fmt.Fprintf(&b, "    User %s\n", sshUser)
+	}
+	fmt.Fprintf(&b, "    ProxyCommand %s\n", proxyCmd)
+	if strings.EqualFold(identityFile, "none") {
+		fmt.Fprintf(&b, "    PubkeyAuthentication no\n")
+	} else if identityFile != "" {
+		fmt.Fprintf(&b, "    IdentityFile %s\n", quoteSSHConfigValue(identityFile))
+	}
+	fmt.Fprintf(&b, "    StrictHostKeyChecking no\n")
+	fmt.Fprintf(&b, "    UserKnownHostsFile %s\n", knownHostsNull)
+	fmt.Fprintf(&b, "    UpdateHostKeys no\n")
+	fmt.Fprintf(&b, "    LogLevel ERROR\n")
+	fmt.Fprintf(&b, "    ServerAliveInterval 30\n")
+	fmt.Fprintf(&b, "    ServerAliveCountMax 3\n")
+	fmt.Fprintf(&b, "# END net_world:%s\n", alias)
+	return b.String(), nil
+}
+
+func quoteSSHConfigValue(v string) string {
+	if strings.ContainsAny(v, " \t\"") {
+		return `"` + strings.ReplaceAll(v, `"`, `\"`) + `"`
+	}
+	return v
+}
+
+// UpsertSSHConfigFile idempotently inserts or updates the managed Host block for alias
+// in configPath (defaults to ~/.ssh/config when empty) and returns the resolved path.
+func UpsertSSHConfigFile(configPath, alias, block string) (string, error) {
+	resolvedPath := strings.TrimSpace(configPath)
+	if resolvedPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve user home dir: %w", err)
+		}
+		resolvedPath = filepath.Join(home, ".ssh", "config")
+	}
+	if err := os.MkdirAll(filepath.Dir(resolvedPath), 0o700); err != nil {
+		return "", fmt.Errorf("create ssh config dir: %w", err)
+	}
+
+	beginMarker := "# BEGIN net_world:" + alias
+	endMarker := "# END net_world:" + alias
+	normalizedBlock := strings.TrimRight(block, "\r\n") + "\n"
+
+	existingBytes, err := os.ReadFile(resolvedPath)
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("read ssh config %s: %w", resolvedPath, err)
+	}
+	existing := strings.ReplaceAll(string(existingBytes), "\r\n", "\n")
+
+	var updated string
+	beginIdx := strings.Index(existing, beginMarker)
+	endIdx := strings.Index(existing, endMarker)
+	if beginIdx >= 0 && endIdx > beginIdx {
+		afterEnd := endIdx + len(endMarker)
+		if afterEnd < len(existing) && existing[afterEnd] == '\n' {
+			afterEnd++
+		}
+		updated = existing[:beginIdx] + normalizedBlock + existing[afterEnd:]
+	} else {
+		trimmed := strings.TrimRight(existing, "\n")
+		if trimmed == "" {
+			updated = normalizedBlock
+		} else {
+			updated = trimmed + "\n\n" + normalizedBlock
+		}
+	}
+
+	if err := os.WriteFile(resolvedPath, []byte(updated), 0o600); err != nil {
+		return "", fmt.Errorf("write ssh config %s: %w", resolvedPath, err)
+	}
+	return resolvedPath, nil
+}
+
+// ExecSSHConfig renders the SSH config block for VS Code Remote - SSH and optionally
+// writes it to ~/.ssh/config (or configPath) when writeToFile is true.
+func (c *StandaloneClient) ExecSSHConfig(portOrIPPort, configPath string, writeToFile bool, args []string) error {
+	alias, dstSpec, err := parseAliasAndTargetArgs("ssh-config", args)
+	if err != nil {
+		return err
+	}
+	block, err := c.RenderSSHConfigBlock(alias, dstSpec, portOrIPPort, "")
+	if err != nil {
+		return err
+	}
+	if !writeToFile {
+		fmt.Print(block)
+		return nil
+	}
+	writtenPath, err := UpsertSSHConfigFile(configPath, alias, block)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "# Updated SSH host %q in %s\n", alias, writtenPath)
+	fmt.Print(block)
+	return nil
+}
+
+// ExecVSCode updates the managed SSH host entry in ~/.ssh/config (or configPath)
+// and launches the local VS Code client connected to `ssh-remote+<alias>`.
+func (c *StandaloneClient) ExecVSCode(portOrIPPort, configPath string, args []string) error {
+	alias, dstSpec, err := parseAliasAndTargetArgs("vscode", args)
+	if err != nil {
+		return err
+	}
+	remotePath := ""
+	if len(args) >= 3 {
+		remotePath = strings.TrimSpace(args[2])
+	}
+	block, err := c.RenderSSHConfigBlock(alias, dstSpec, portOrIPPort, "")
+	if err != nil {
+		return err
+	}
+	writtenPath, err := UpsertSSHConfigFile(configPath, alias, block)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "# Configured SSH host %q in %s\n", alias, writtenPath)
+
+	codeExe, err := findVSCodeExecutable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "# VS Code CLI ('code') not found in PATH. Connect manually in VS Code Remote-SSH to host: %s\n", alias)
+		return nil
+	}
+
+	codeArgs := []string{"--remote", "ssh-remote+" + alias}
+	if remotePath != "" {
+		codeArgs = append(codeArgs, remotePath)
+	} else {
+		codeArgs = append([]string{"--new-window"}, codeArgs...)
+	}
+
+	cmd := exec.Command(codeExe, codeArgs...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("launch vscode (%s %s): %w", codeExe, strings.Join(codeArgs, " "), err)
+	}
+	return nil
+}
+
+func parseAliasAndTargetArgs(subcmd string, args []string) (alias string, dstSpec string, err error) {
+	if len(args) == 1 {
+		return "networld-remote", args[0], nil
+	}
+	if len(args) >= 2 {
+		return args[0], args[1], nil
+	}
+	return "", "", fmt.Errorf("%s requires [<alias>] [user@]<tc-addr>", subcmd)
+}
+
+func findVSCodeExecutable() (string, error) {
+	for _, bin := range []string{"code", "code-insiders", "cursor"} {
+		if p, err := exec.LookPath(bin); err == nil {
+			return p, nil
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		macCandidates := []string{
+			"/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+			"/Applications/Visual Studio Code - Insiders.app/Contents/Resources/app/bin/code",
+			"/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
+		}
+		for _, p := range macCandidates {
+			if _, err := os.Stat(p); err == nil {
+				return p, nil
+			}
+		}
+	}
+	return "", errors.New("vscode CLI not found")
+}
+
