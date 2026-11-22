@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"unsafe"
@@ -80,7 +81,7 @@ func runSessionWithPTY(sess ssh.Session, cmd *exec.Cmd, ptyReq ssh.Pty, winCh <-
 	defer cp.Close()
 
 	go func() {
-		_, _ = io.Copy(cp.inWrite, sess)
+		_, _ = io.Copy(cp, sess)
 	}()
 
 	go func() {
@@ -89,14 +90,30 @@ func runSessionWithPTY(sess ssh.Session, cmd *exec.Cmd, ptyReq ssh.Pty, winCh <-
 		}
 	}()
 
-	// Drain output before CloseConsole so conhost does not block on pending writes.
+	// Drain output until EOF before CloseConsole completes so conhost cannot
+	// block on a full output pipe even if sess closes early.
 	outDone := make(chan struct{})
 	go func() {
 		defer close(outDone)
-		_, _ = io.Copy(sess, cp.outRead)
+		_, _ = io.Copy(sess, cp)
+		_, _ = io.Copy(io.Discard, cp)
+	}()
+
+	// Terminate the attached process if the SSH client disconnects abruptly.
+	waitDone := make(chan struct{})
+	cancelDone := make(chan struct{})
+	go func() {
+		defer close(cancelDone)
+		select {
+		case <-sess.Context().Done():
+			cp.Terminate()
+		case <-waitDone:
+		}
 	}()
 
 	code, err := cp.WaitExitCode()
+	close(waitDone)
+	<-cancelDone
 
 	// Closing the pseudoconsole releases conhost's write handle so outRead sees EOF.
 	cp.CloseConsole()
@@ -114,36 +131,56 @@ func runSessionWithPTY(sess ssh.Session, cmd *exec.Cmd, ptyReq ssh.Pty, winCh <-
 type conPTY struct {
 	inWrite *os.File
 	outRead *os.File
-	proc    windows.Handle
 
-	mu     sync.Mutex
-	hpc    windows.Handle
-	closed bool
+	mu         sync.Mutex
+	hpc        windows.Handle
+	closed     bool
+	proc       windows.Handle
+	procClosed bool
 }
 
 // startConPTY creates a pseudoconsole and spawns cmd attached to it via CreateProcess.
 func startConPTY(cmd *exec.Cmd, width, height int) (*conPTY, error) {
-	if width <= 0 {
-		width = 80
-	}
-	if height <= 0 {
-		height = 24
-	}
-
-	inRead, inWrite, err := os.Pipe()
+	hpc, inWrite, outRead, err := createPseudoConsole(width, height)
 	if err != nil {
 		return nil, err
+	}
+
+	proc, err := spawnAttachedProcess(cmd, hpc)
+	if err != nil {
+		windows.ClosePseudoConsole(hpc)
+		_ = inWrite.Close()
+		_ = outRead.Close()
+		return nil, err
+	}
+
+	return &conPTY{
+		inWrite: inWrite,
+		outRead: outRead,
+		hpc:     hpc,
+		proc:    proc,
+	}, nil
+}
+
+func createPseudoConsole(width, height int) (windows.Handle, *os.File, *os.File, error) {
+	inRead, inWrite, err := os.Pipe()
+	if err != nil {
+		return 0, nil, nil, err
 	}
 	outRead, outWrite, err := os.Pipe()
 	if err != nil {
 		_ = inRead.Close()
 		_ = inWrite.Close()
-		return nil, err
+		return 0, nil, nil, err
 	}
 
 	var hpc windows.Handle
+	size := windows.Coord{
+		X: clampConPTYCoord(width, 80, maxConPTYWidth),
+		Y: clampConPTYCoord(height, 24, maxConPTYHeight),
+	}
 	err = windows.CreatePseudoConsole(
-		windows.Coord{X: int16(width), Y: int16(height)},
+		size,
 		windows.Handle(inRead.Fd()),
 		windows.Handle(outWrite.Fd()),
 		0,
@@ -155,37 +192,30 @@ func startConPTY(cmd *exec.Cmd, width, height int) (*conPTY, error) {
 	if err != nil {
 		_ = inWrite.Close()
 		_ = outRead.Close()
-		return nil, fmt.Errorf("CreatePseudoConsole: %w", err)
+		return 0, nil, nil, fmt.Errorf("CreatePseudoConsole: %w", err)
 	}
+	return hpc, inWrite, outRead, nil
+}
 
-	cleanup := func() {
-		windows.ClosePseudoConsole(hpc)
-		_ = inWrite.Close()
-		_ = outRead.Close()
-	}
-
+func spawnAttachedProcess(cmd *exec.Cmd, hpc windows.Handle) (windows.Handle, error) {
 	attrs, err := windows.NewProcThreadAttributeList(1)
 	if err != nil {
-		cleanup()
-		return nil, err
+		return 0, err
 	}
 	defer attrs.Delete()
 	if err := updatePseudoConsoleAttr(attrs.List(), hpc); err != nil {
-		cleanup()
-		return nil, err
+		return 0, err
 	}
 
 	cmdLine, err := windows.UTF16FromString(windows.ComposeCommandLine(cmd.Args))
 	if err != nil {
-		cleanup()
-		return nil, err
+		return 0, err
 	}
 	var dir *uint16
 	if cmd.Dir != "" {
 		dir, err = windows.UTF16PtrFromString(cmd.Dir)
 		if err != nil {
-			cleanup()
-			return nil, err
+			return 0, err
 		}
 	}
 	envSlice := cmd.Env
@@ -194,8 +224,7 @@ func startConPTY(cmd *exec.Cmd, width, height int) (*conPTY, error) {
 	}
 	env, err := windowsEnvBlock(envSlice)
 	if err != nil {
-		cleanup()
-		return nil, err
+		return 0, err
 	}
 
 	si := &windows.StartupInfoEx{
@@ -221,17 +250,10 @@ func startConPTY(cmd *exec.Cmd, width, height int) (*conPTY, error) {
 		&pi,
 	)
 	if err != nil {
-		cleanup()
-		return nil, fmt.Errorf("CreateProcess: %w", err)
+		return 0, fmt.Errorf("CreateProcess: %w", err)
 	}
 	_ = windows.CloseHandle(pi.Thread)
-
-	return &conPTY{
-		inWrite: inWrite,
-		outRead: outRead,
-		proc:    pi.Process,
-		hpc:     hpc,
-	}, nil
+	return pi.Process, nil
 }
 
 // updatePseudoConsoleAttr passes the pseudoconsole handle directly because its
@@ -252,17 +274,48 @@ func updatePseudoConsoleAttr(list *windows.ProcThreadAttributeList, hpc windows.
 	return nil
 }
 
+const (
+	// Cap ConPTY dimensions to prevent oversized client window-change requests
+	// from causing conhost.exe to allocate gigabytes of screen buffer memory.
+	maxConPTYWidth  = 1024
+	maxConPTYHeight = 512
+)
+
+func clampConPTYCoord(v, fallback, maxVal int) int16 {
+	if v <= 0 {
+		v = fallback
+	}
+	if v > maxVal {
+		v = maxVal
+	}
+	return int16(v)
+}
+
+// Read reads terminal output produced by the attached process.
+func (c *conPTY) Read(p []byte) (int, error) {
+	return c.outRead.Read(p)
+}
+
+// Write sends terminal input to the attached process.
+func (c *conPTY) Write(p []byte) (int, error) {
+	return c.inWrite.Write(p)
+}
+
 // Resize updates the pseudoconsole dimensions. It is a no-op after CloseConsole.
 func (c *conPTY) Resize(width, height int) error {
 	if width <= 0 || height <= 0 {
 		return nil
+	}
+	coord := windows.Coord{
+		X: clampConPTYCoord(width, 1, maxConPTYWidth),
+		Y: clampConPTYCoord(height, 1, maxConPTYHeight),
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
 		return nil
 	}
-	return windows.ResizePseudoConsole(c.hpc, windows.Coord{X: int16(width), Y: int16(height)})
+	return windows.ResizePseudoConsole(c.hpc, coord)
 }
 
 // WaitExitCode waits for the attached process to exit and returns its exit code.
@@ -275,6 +328,16 @@ func (c *conPTY) WaitExitCode() (int, error) {
 		return 0, err
 	}
 	return int(code), nil
+}
+
+// Terminate forcefully terminates the attached process and closes the pseudoconsole.
+func (c *conPTY) Terminate() {
+	c.mu.Lock()
+	if !c.procClosed {
+		_ = windows.TerminateProcess(c.proc, 1)
+	}
+	c.mu.Unlock()
+	c.CloseConsole()
 }
 
 // CloseConsole closes the pseudoconsole handle without closing pipes or the process handle.
@@ -292,14 +355,24 @@ func (c *conPTY) Close() {
 	c.CloseConsole()
 	_ = c.inWrite.Close()
 	_ = c.outRead.Close()
-	_ = windows.CloseHandle(c.proc)
+
+	c.mu.Lock()
+	if !c.procClosed {
+		c.procClosed = true
+		_ = windows.CloseHandle(c.proc)
+	}
+	c.mu.Unlock()
 }
 
-// windowsEnvBlock builds a UTF-16, NUL-separated, double-NUL-terminated environment
-// block for CreateProcess, deduplicating keys case-insensitively (last wins).
+// windowsEnvBlock builds a sorted, UTF-16, NUL-separated, double-NUL-terminated
+// environment block for CreateProcess, deduplicating keys case-insensitively (last wins).
 func windowsEnvBlock(env []string) (*uint16, error) {
+	type envEntry struct {
+		upperKey string
+		kv       string
+	}
 	seen := make(map[string]int)
-	var list []string
+	var list []envEntry
 	for _, kv := range env {
 		k, _, ok := strings.Cut(kv, "=")
 		if !ok || k == "" {
@@ -307,19 +380,24 @@ func windowsEnvBlock(env []string) (*uint16, error) {
 		}
 		uk := strings.ToUpper(k)
 		if i, dup := seen[uk]; dup {
-			list[i] = kv
+			list[i].kv = kv
 		} else {
 			seen[uk] = len(list)
-			list = append(list, kv)
+			list = append(list, envEntry{upperKey: uk, kv: kv})
 		}
 	}
 	if len(list) == 0 {
 		block := []uint16{0, 0}
 		return &block[0], nil
 	}
+	// MSDN requires the CreateProcess environment block to be sorted case-insensitively by name.
+	slices.SortFunc(list, func(a, b envEntry) int {
+		return strings.Compare(a.upperKey, b.upperKey)
+	})
+
 	var block []uint16
-	for _, kv := range list {
-		u, err := windows.UTF16FromString(kv)
+	for _, entry := range list {
+		u, err := windows.UTF16FromString(entry.kv)
 		if err != nil {
 			return nil, err
 		}
